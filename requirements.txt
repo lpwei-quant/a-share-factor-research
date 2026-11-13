@@ -1,7 +1,7 @@
-akshare==1.19.1
+akshare==1.20.38
 baostock==0.9.4
-matplotlib==3.11.2
+matplotlib==3.11.1
 numpy==2.5.4
-pandas==3.0.6
-pyarrow==26.0.0
+pandas==3.1.1
+pyarrow==26.0.1
 requests==2.34.2

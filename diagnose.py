@@ -4,7 +4,7 @@
 输入: results/composite_group_returns.csv、results/ic_monthly.csv（由 research.py 生成）
 输出: results/composite_yearly.csv、results/long_short_worst_months.csv
 
-要回答的问题: 合成因子年化 ICIR 2.66, 为什么多空组合夏普只有 0.87?
+要回答的问题: 合成因子年化 ICIR 超过 2.5, 为什么多空组合夏普不到 1?
 """
 from pathlib import Path
 
