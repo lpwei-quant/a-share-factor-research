@@ -10,6 +10,9 @@
 - 交易成本按单边 0.15% 计, 作用于每期组合换手
 - 股票池: 上市满一年、调仓日非 ST、非停牌、未涨跌停（涨停买不进、跌停卖不出）
 - ST 状态: 深市用交易所简称变更记录; 沪市主板用 5% 涨跌幅限制推断, 并在深市主板上检验推断的准确率
+- 2026-07-06 起主板风险警示股票涨跌幅限制由 5% 调整为 10%: 此后 ST 股按 10% 判断涨跌停,
+  沪市 ST 状态无法再从价格推断, 沿用规则变更前最后一个交易日的状态
+- 换手按持仓漂移计算: 上期持仓先按持有期收益变动权重, 再与本期目标权重比较
 - 已退市股票在退市前照常进入样本, 退市后按最后成交价计
 """
 import json
@@ -40,6 +43,7 @@ FACTORS = {
 COMPOSITE_PARTS = ["rev_20", "vol_20", "turn_20", "illiq_20"]
 SPLIT = "2023-01-01"
 CHINEXT_20PCT = "2020-08-24"    # 创业板涨跌幅限制由 10% 放宽到 20% 的首个交易日
+ST_10PCT = "2026-07-06"         # 主板风险警示股票涨跌幅限制由 5% 调整为 10% 的首个交易日
 
 
 def load():
@@ -51,10 +55,11 @@ def load():
     st_sz = pd.read_csv(DATA_DIR / "st_intervals.csv", dtype={"code": str}, parse_dates=["start", "end"])
     wide = {c: daily.pivot(index="date", columns="code", values=c)
             for c in ["close", "high", "low", "amount", "turn", "volume"]}
-    industry = ind.set_index("code")["industry"].replace("", "NA")   # 已退市股票无行业, 中性化时归入 NA
+    industry = ind.set_index("code")["industry"].replace("", "NA")   # 查不到行业的股票中性化时归入 NA
+    names = ind.set_index("code")["name"]                            # 下载当日（2026-11）的简称
     ipo = pd.to_datetime(basic.set_index("code")["ipoDate"])
     listed = set(basic.loc[basic["status"] == "1", "code"])           # 样本期末仍在市的股票
-    return wide, industry, ipo, listed, st_sz
+    return wide, industry, ipo, listed, st_sz, names
 
 
 def st_from_records(index, columns, st_sz):
@@ -72,6 +77,7 @@ def st_from_limits(w, traded):
     进入: 10 个交易日内两次收在 5% 涨跌停附近（4.4%–5.6%, 低价股涨跌停价取整后会偏离 5%）,
           且期间没有超过 5.7% 的涨跌;
     退出: 出现超过 5.7% 的单日涨跌（说明已恢复 10% 限制）。
+    2026-07-06 起 ST 股票同样适用 10% 限制, 价格不再能区分 ST, 此后沿用变更前最后一个交易日的状态。
     """
     pct = w["pctChg"].where(traded).abs()
     at_edge = (w["close"] >= w["high"]) | (w["close"] <= w["low"])
@@ -80,6 +86,11 @@ def st_from_limits(w, traded):
     enter = (hit5.rolling(10, min_periods=1).sum() >= 2) & (big.rolling(10, min_periods=1).sum() == 0)
     state = pd.DataFrame(np.nan, index=pct.index, columns=pct.columns)
     state = state.mask(big, 0.0).mask(enter, 1.0).ffill().fillna(0.0) == 1.0
+    after = pct.index >= ST_10PCT
+    if after.any() and (~after).any():
+        vals = state.to_numpy().copy()
+        vals[after] = vals[~after][-1]
+        state = pd.DataFrame(vals, index=state.index, columns=state.columns)
     main_board = pct.columns.str.startswith(("60", "00"))
     state.loc[:, ~main_board] = False
     return state
@@ -118,10 +129,12 @@ def build_factors(w, st_sz):
     is_sz = close.columns.str.startswith(("00", "30"))
     st = st_inferred.copy()
     st.loc[:, is_sz] = st_exact.loc[:, is_sz]
-    # 收盘价封在涨停（跌停）价: 收盘 = 最高（最低）且涨跌幅达到限制; ST 股票限制为 5%
+    # 收盘价封在涨停（跌停）价: 收盘 = 最高（最低）且涨跌幅达到限制; 2026-07-06 前 ST 股票限制为 5%
     # 涨跌停价按分取整, 低价股实际涨跌幅会偏离名义限制, 因此留出容差
-    lim = limit_pct(close.index, close.columns).mask(st, 5.0)
-    tol = pd.DataFrame(0.3, index=close.index, columns=close.columns).mask(st, 0.6)
+    before = pd.Series(close.index < ST_10PCT, index=close.index)
+    st5 = st.mul(before, axis=0).astype(bool)
+    lim = limit_pct(close.index, close.columns).mask(st5, 5.0)
+    tol = pd.DataFrame(0.3, index=close.index, columns=close.columns).mask(st5, 0.6)
     at_limit = traded & (((w["close"] >= w["high"]) & (w["pctChg"] >= lim - tol)) |
                          ((w["close"] <= w["low"]) & (w["pctChg"] <= -(lim - tol))))
     masks = {
@@ -227,7 +240,10 @@ def ic_decay(cs, col):
 
 
 def group_backtest(cs, col):
-    """五分组等权回测, 扣除换手成本。返回各组净收益序列与换手率。"""
+    """五分组等权回测, 扣除换手成本。返回各组净收益序列与换手率。
+
+    换手 = 本期目标权重与上期持仓漂移后权重之差的一半; 成本按单边 COST 作用于买卖总额。
+    """
     rets, turnover, prev = {}, {}, {}
     for t, df in cs.items():
         d = df[[col, "fwd_1"]].dropna()
@@ -240,7 +256,8 @@ def group_backtest(cs, col):
             traded = w.sub(pw, fill_value=0).abs().sum()
             to[k] = traded / 2
             r[k] = d.loc[members, "fwd_1"].mean() - COST * traded
-            prev[k] = w
+            grown = w * (1 + d.loc[members, "fwd_1"])          # 持有期结束时的实际权重
+            prev[k] = grown / grown.sum()
         r["universe"] = d["fwd_1"].mean()
         rets[t], turnover[t] = r, to
     rets = pd.DataFrame(rets).T
@@ -262,16 +279,42 @@ def perf(r):
 
 
 def st_inference_check(masks, dates):
-    """在深市主板上, 用交易所记录检验“5% 涨跌幅推断 ST”的准确率（只看调仓日、可交易的股票）。"""
+    """在深市主板上, 用交易所记录检验沪市 ST 的识别方法（只看调仓日、可交易的股票）。
+
+    2026-07-06 前检验“5% 涨跌幅推断”; 之后检验“沿用变更前状态”。
+    """
     cols = masks["st_exact"].columns[masks["st_exact"].columns.str.startswith("00")]
-    ok = masks["eligible"].loc[dates, cols]
-    truth, guess = masks["st_exact"].loc[dates, cols] & ok, masks["st_inferred"].loc[dates, cols] & ok
-    hit = (truth & guess).values.sum()
+    out = {}
+    for name, ds in {"规则变更前_价格推断": [d for d in dates if d < pd.Timestamp(ST_10PCT)],
+                     "规则变更后_沿用状态": [d for d in dates if d >= pd.Timestamp(ST_10PCT)]}.items():
+        if not ds:
+            continue
+        ok = masks["eligible"].loc[ds, cols]
+        truth, guess = masks["st_exact"].loc[ds, cols] & ok, masks["st_inferred"].loc[ds, cols] & ok
+        hit = (truth & guess).values.sum()
+        out[name] = {
+            "调仓期数": len(ds),
+            "交易所记录ST数": int(truth.values.sum()),
+            "识别为ST数": int(guess.values.sum()),
+            "召回率": round(hit / truth.values.sum(), 4),
+            "精确率": round(hit / guess.values.sum(), 4),
+        }
+    return out
+
+
+def st_name_check(masks, names, listed):
+    """沪市主板仍在市股票: 样本期末沿用的 ST 状态与下载当日（2026-11）简称是否一致。"""
+    st_end = masks["st"].iloc[-1]
+    cols = [c for c in st_end.index if c.startswith("60") and c in listed and c in names.index]
+    by_name = names.reindex(cols).str.upper().str.contains("ST")
+    by_state = st_end.reindex(cols)
     return {
-        "深市主板调仓日ST股票数_交易所记录": int(truth.values.sum()),
-        "推断为ST数": int(guess.values.sum()),
-        "召回率": round(hit / truth.values.sum(), 4),
-        "精确率": round(hit / guess.values.sum(), 4),
+        "沪市主板在市股票数": len(cols),
+        "期末判为ST": int(by_state.sum()),
+        "当前简称含ST": int(by_name.sum()),
+        "两者一致": int((by_state == by_name).sum()),
+        "判为ST但简称不含ST": int((by_state & ~by_name).sum()),
+        "简称含ST但未判为ST": int((~by_state & by_name).sum()),
     }
 
 
@@ -320,7 +363,7 @@ def plot(ic, rets, path_ic, path_nav):
 
 def main():
     (OUT / "figures").mkdir(parents=True, exist_ok=True)
-    wide, industry, ipo, listed, st_sz = load()
+    wide, industry, ipo, listed, st_sz, names = load()
     f, close, masks, logcap = build_factors(wide, st_sz)
     dates = rebal_dates(close.index)
     cols = list(FACTORS) + ["composite"]
@@ -374,6 +417,7 @@ def main():
         "其中已退市": int(close.shape[1] - len(listed & set(close.columns))),
         "日频记录数": int(wide["close"].notna().values.sum()),
         "ST推断检验": st_inference_check(masks, list(cs)),
+        "沪市ST期末简称核对": st_name_check(masks, names, listed),
         "平均截面股票数": float(np.mean([len(d) for d in cs.values()])),
         "每期平均ST股票数": round(n_st, 1),
         "每期平均涨跌停股票数": round(n_lim, 1),
@@ -397,7 +441,7 @@ def main():
     print(group_perf.round(4))
     print(yearly.round(4))
     for k in ["样本股票数", "其中已退市", "日频记录数", "平均截面股票数", "每期平均ST股票数", "每期平均涨跌停股票数",
-              "ST推断检验", "合成因子各组平均单边换手"]:
+              "ST推断检验", "沪市ST期末简称核对", "合成因子各组平均单边换手"]:
         print(k, json.dumps(summary[k], ensure_ascii=False))
     for k in ["分段检验", "稳健性_剔除小市值30%", "稳健性_T+1成交", "稳健性_剔除跳空",
               "对照_基准", "对照_不剔除ST", "对照_不剔除涨跌停", "对照_仅在市股票"]:
